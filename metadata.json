@@ -1,0 +1,7 @@
+{
+  "name": "StudyFlow - AI YouTube Study Planner",
+  "description": "Transform YouTube educational playlists into a structured, personalized day-by-day exam preparation schedule with progress tracking and automatic catch-up.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
