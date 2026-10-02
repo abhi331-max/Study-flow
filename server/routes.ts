@@ -153,102 +153,89 @@ router.get('/auth/config', (_req: Request, res: Response) => {
   });
 });
 
-// Google One-Tap / OAuth Credential or Token verification & sync
+// Google One-Tap / Identity Services Credential verification & sync
 router.post('/auth/google', authLimiter, async (req: Request, res: Response) => {
   try {
-    const { credential, accessToken } = req.body;
+    const { credential } = req.body;
 
-    if (!credential && !accessToken) {
-      res.status(400).json({ error: 'Google credential or access token is required' });
+    if (!credential || typeof credential !== 'string') {
+      res.status(400).json({ error: 'Google credential (ID token) is required' });
       return;
     }
 
-    let email = '';
-    let name = '';
-    let googleSub = '';
-
-    // 1. Cryptographically verify Google ID Token credential (from Google Identity Services)
-    if (credential && typeof credential === 'string') {
-      const googleClientId = process.env.GOOGLE_CLIENT_ID || process.env.VITE_GOOGLE_CLIENT_ID || '';
-      const client = new OAuth2Client(googleClientId || undefined);
-
-      try {
-        const ticket = await client.verifyIdToken({
-          idToken: credential,
-          audience: googleClientId || undefined,
-        });
-
-        const payload = ticket.getPayload();
-        if (!payload) {
-          res.status(401).json({ error: 'Invalid Google credential token payload' });
-          return;
-        }
-
-        const validIssuers = ['accounts.google.com', 'https://accounts.google.com'];
-        if (!payload.iss || !validIssuers.includes(payload.iss)) {
-          res.status(401).json({ error: 'Invalid Google token issuer' });
-          return;
-        }
-
-        if (!payload.sub || !payload.email) {
-          res.status(401).json({ error: 'Verified Google token missing required identity claims' });
-          return;
-        }
-
-        googleSub = payload.sub;
-        email = String(payload.email).trim().toLowerCase();
-        name = payload.name ? String(payload.name).trim() : (email.split('@')[0]);
-      } catch (verifyErr: any) {
-        securityLogger.log({
-          type: 'AUTH_LOGIN_FAILED',
-          ip: req.ip || String(req.socket.remoteAddress),
-          details: `Google ID token verification failed: ${verifyErr.message || 'Signature/Audience check failed'}`
-        });
-        res.status(401).json({ error: 'Google authentication failed. Invalid token.' });
-        return;
-      }
-    }
-
-    // 2. Cryptographically verify Google OAuth Access Token if provided
-    if (accessToken && typeof accessToken === 'string' && (!email || !googleSub)) {
-      try {
-        const userInfoRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
-          headers: { Authorization: `Bearer ${accessToken}` }
-        });
-        if (!userInfoRes.ok) {
-          res.status(401).json({ error: 'Invalid or expired Google access token' });
-          return;
-        }
-        const userInfo = await userInfoRes.json();
-        if (!userInfo.sub || !userInfo.email) {
-          res.status(401).json({ error: 'Verified Google userinfo missing identity claims' });
-          return;
-        }
-        googleSub = userInfo.sub;
-        email = String(userInfo.email).trim().toLowerCase();
-        name = userInfo.name ? String(userInfo.name).trim() : (email.split('@')[0]);
-      } catch (fetchErr: any) {
-        res.status(401).json({ error: 'Failed to verify Google access token' });
-        return;
-      }
-    }
-
-    if (!email || !googleSub) {
-      res.status(401).json({ error: 'Verified Google account email and sub are required' });
+    const googleClientId = process.env.GOOGLE_CLIENT_ID || process.env.VITE_GOOGLE_CLIENT_ID || '';
+    if (!googleClientId) {
+      res.status(503).json({ error: 'Google Sign-In is not configured yet. Please use email and password.' });
       return;
     }
+
+    const client = new OAuth2Client(googleClientId);
+
+    let ticket: any;
+    try {
+      ticket = await client.verifyIdToken({
+        idToken: credential,
+        audience: googleClientId,
+      });
+    } catch (verifyErr: any) {
+      securityLogger.log({
+        type: 'AUTH_LOGIN_FAILED',
+        ip: req.ip || String(req.socket.remoteAddress),
+        details: `Google ID token verification failed: ${verifyErr.message || 'Signature/Audience check failed'}`
+      });
+      res.status(401).json({ error: 'Google authentication failed. Invalid token.' });
+      return;
+    }
+
+    const payload = ticket.getPayload();
+    if (!payload) {
+      res.status(401).json({ error: 'Invalid Google credential token payload' });
+      return;
+    }
+
+    const validIssuers = ['accounts.google.com', 'https://accounts.google.com'];
+    if (!payload.iss || !validIssuers.includes(payload.iss)) {
+      res.status(401).json({ error: 'Invalid Google token issuer' });
+      return;
+    }
+
+    if (!payload.sub || !payload.email) {
+      res.status(401).json({ error: 'Verified Google token missing required identity claims' });
+      return;
+    }
+
+    // Verify audience explicitly matches the configured GOOGLE_CLIENT_ID
+    if (payload.aud !== googleClientId) {
+      res.status(401).json({ error: 'Google token audience does not match GOOGLE_CLIENT_ID' });
+      return;
+    }
+
+    // Verify expiration timestamp
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (payload.exp && payload.exp < nowSec) {
+      res.status(401).json({ error: 'Google ID token has expired' });
+      return;
+    }
+
+    const googleSub = String(payload.sub);
+    const email = String(payload.email).trim().toLowerCase();
+    const name = payload.name ? String(payload.name).trim() : (email.split('@')[0]);
 
     const now = new Date().toISOString();
     
-    // Look up user by Google's permanent unique sub identifier first, then fallback to email
+    // Look up user by Google's permanent unique sub identifier first, then fallback to verified email
     let user: any = null;
     if (googleSub) {
       user = db.prepare('SELECT * FROM users WHERE google_sub = ?').get(googleSub);
     }
     if (!user) {
       user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
-      // Link google_sub if user was found by email and has a sub
-      if (user && googleSub && !user.google_sub) {
+      // Link google_sub if user was found by verified email
+      if (user) {
+        if (user.google_sub && user.google_sub !== googleSub) {
+          res.status(409).json({ error: 'This email account is already linked to a different Google account.' });
+          return;
+        }
         db.prepare('UPDATE users SET google_sub = ?, email_verified = 1, updated_at = ? WHERE id = ?').run(googleSub, now, user.id);
         user.google_sub = googleSub;
       }
@@ -270,7 +257,7 @@ router.post('/auth/google', authLimiter, async (req: Request, res: Response) => 
         'Competitive Exam',
         3,
         'smart_interleaved',
-        googleSub || null,
+        googleSub,
         now,
         now
       );
@@ -1276,14 +1263,14 @@ router.delete('/subjects/:id', requireAuth, (req: Request, res: Response) => {
 // ----------------------------------------------------
 async function handlePlaylistPreview(req: Request, res: Response) {
   try {
-    const { urlOrId, url } = req.body;
-    const target = urlOrId || url;
-    if (!target) {
+    const { urlOrId, url, playlistId } = req.body;
+    const target = urlOrId || url || playlistId;
+    if (!target || typeof target !== 'string' || !target.trim()) {
       res.status(400).json({ error: 'Playlist URL or ID is required' });
       return;
     }
 
-    const preview = await fetchPlaylistData(target);
+    const preview = await fetchPlaylistData(target.trim());
     const videos = preview.videos.map(v => ({
       ...v,
       id: v.youtubeVideoId
@@ -1300,7 +1287,7 @@ async function handlePlaylistPreview(req: Request, res: Response) {
 
     res.json(responsePayload);
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to preview playlist' });
+    res.status(400).json({ error: err.message || 'Failed to preview playlist' });
   }
 }
 

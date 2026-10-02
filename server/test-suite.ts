@@ -27,6 +27,10 @@ assert(!verifyPassword('wrongPassword', hash), 'Reject wrong password');
 // 2. YouTube Parsing & ISO Duration
 assert(extractPlaylistId('https://www.youtube.com/playlist?list=PL_network_theory_gate') === 'PL_network_theory_gate', 'Extract playlist ID from standard URL');
 assert(extractPlaylistId('https://youtu.be/watch?v=123&list=PL123456789012') === 'PL123456789012', 'Extract playlist ID with video param');
+assert(extractPlaylistId('https://www.youtube.com/watch?v=PlbupGCBV6w&list=PLsyeobzWxl7rrvgG7MLNIMSTzVCDZZcT4') === 'PLsyeobzWxl7rrvgG7MLNIMSTzVCDZZcT4', 'Extract playlist ID from watch URL with list param');
+assert(extractPlaylistId('https://m.youtube.com/playlist?list=PLsyeobzWxl7rrvgG7MLNIMSTzVCDZZcT4') === 'PLsyeobzWxl7rrvgG7MLNIMSTzVCDZZcT4', 'Extract playlist ID from mobile YouTube URL');
+assert(extractPlaylistId('https://music.youtube.com/playlist?list=PLsyeobzWxl7rrvgG7MLNIMSTzVCDZZcT4') === 'PLsyeobzWxl7rrvgG7MLNIMSTzVCDZZcT4', 'Extract playlist ID from music YouTube URL');
+assert(extractPlaylistId('PLsyeobzWxl7rrvgG7MLNIMSTzVCDZZcT4') === 'PLsyeobzWxl7rrvgG7MLNIMSTzVCDZZcT4', 'Extract playlist ID from raw ID string');
 assert(extractVideoId('https://www.youtube.com/watch?v=dQw4w9WgXcQ') === 'dQw4w9WgXcQ', 'Extract 11-char video ID from watch URL');
 assert(extractVideoId('https://youtu.be/dQw4w9WgXcQ?t=10') === 'dQw4w9WgXcQ', 'Extract video ID from youtu.be short URL');
 assert(parseIso8601Duration('PT1H15M30S') === 4530, 'Parse PT1H15M30S duration to seconds');

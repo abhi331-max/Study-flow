@@ -172,39 +172,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({ onStartDemo, onAuthSuc
     try {
       const google = typeof window !== "undefined" ? (window as any).google : null;
 
-      // 1. If GIS OAuth2 token client is available with client ID, open native Google account chooser popup
-      if (google?.accounts?.oauth2) {
-        const tokenClient = google.accounts.oauth2.initTokenClient({
-          client_id: googleClientId,
-          scope: "openid email profile",
-          callback: async (tokenResponse: any) => {
-            if (tokenResponse.error) {
-              setError(tokenResponse.error_description || tokenResponse.error || "Google Sign-In was cancelled or failed");
-              setGoogleLoading(false);
-              return;
-            }
-            try {
-              const res = await fetch("/api/auth/google", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ accessToken: tokenResponse.access_token })
-              });
-              const data = await res.json();
-              if (!res.ok) throw new Error(data.error || "Google authentication failed");
-              localStorage.setItem("studyflow_token", data.token);
-              onAuthSuccess(data.token, data.user);
-            } catch (err: any) {
-              setError(err.message || "Google authentication failed");
-            } finally {
-              setGoogleLoading(false);
-            }
-          }
-        });
-        tokenClient.requestAccessToken({ prompt: "select_account" });
-        return;
-      }
-
-      // 2. If GIS One-Tap is available, trigger prompt
+      // Trigger Google Identity Services One-Tap / Account Chooser prompt
       if (google?.accounts?.id) {
         google.accounts.id.prompt((notification: any) => {
           if (notification.isNotDisplayed() || notification.isSkippedMoment()) {

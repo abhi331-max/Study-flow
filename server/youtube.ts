@@ -19,7 +19,7 @@ export interface PlaylistFetchResult {
   totalDurationSeconds: number;
   thumbnailUrl: string;
   videos: ParsedYouTubeItem[];
-  source: 'api' | 'fallback_preset' | 'parsed';
+  source: 'api' | 'fallback_preset' | 'parsed' | 'scraped';
 }
 
 // Convert ISO 8601 duration (e.g. PT1H15M30S) to seconds
@@ -37,9 +37,7 @@ export function isAllowedYouTubeHost(hostname: string): boolean {
   const clean = hostname.toLowerCase();
   return (
     clean === 'youtube.com' ||
-    clean === 'www.youtube.com' ||
-    clean === 'm.youtube.com' ||
-    clean === 'music.youtube.com' ||
+    clean.endsWith('.youtube.com') ||
     clean === 'youtu.be'
   );
 }
@@ -48,36 +46,44 @@ export function extractPlaylistId(urlOrId: string): string | null {
   if (!urlOrId || typeof urlOrId !== 'string') return null;
   const trimmed = urlOrId.trim();
 
-  // If it's a direct alphanumeric playlist ID
-  if (/^[a-zA-Z0-9_-]{10,64}$/.test(trimmed) && (trimmed.startsWith('PL') || trimmed.startsWith('UU') || trimmed.startsWith('FL') || trimmed.startsWith('RD') || trimmed.startsWith('OL'))) {
+  // 1. Exact match for curated preset keys
+  if (CURATED_EDUCATIONAL_PLAYLISTS[trimmed]) {
     return trimmed;
   }
 
-  // If it looks like a URL, validate strictly
-  if (trimmed.includes('http://') || trimmed.includes('https://') || trimmed.includes('.com') || trimmed.includes('.be')) {
-    try {
-      const url = new URL(trimmed.startsWith('http') ? trimmed : `https://${trimmed}`);
-      
-      // Enforce protocol & hostname allowlist
-      if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-        return null;
-      }
-      if (!isAllowedYouTubeHost(url.hostname)) {
-        return null;
-      }
-
-      const list = url.searchParams.get('list');
-      if (list && /^[a-zA-Z0-9_-]{10,64}$/.test(list)) {
-        return list;
-      }
-    } catch {
-      return null;
-    }
+  // 2. Direct alphanumeric/dash/underscore playlist ID (e.g. PL..., UU..., FL..., RD..., OLAK5uy_..., etc.)
+  if (/^[a-zA-Z0-9_-]{10,64}$/.test(trimmed) && 
+      !trimmed.includes('/') && 
+      !trimmed.includes('.') && 
+      !trimmed.includes('?') && 
+      !trimmed.includes('&') && 
+      !trimmed.includes('=')) {
+    return trimmed;
   }
 
-  // Fallback regex for dirty inputs, but ensure extracted ID is safe alphanumeric
-  const match = trimmed.match(/[?&]list=([a-zA-Z0-9_-]{10,64})/);
-  if (match) return match[1];
+  // 3. Robust URL search parameter parsing
+  try {
+    const urlStr = trimmed.startsWith('http://') || trimmed.startsWith('https://') 
+      ? trimmed 
+      : `https://${trimmed}`;
+    const url = new URL(urlStr);
+    
+    // Check hostname
+    if (isAllowedYouTubeHost(url.hostname)) {
+      const listParam = url.searchParams.get('list');
+      if (listParam && /^[a-zA-Z0-9_-]{10,64}$/.test(listParam)) {
+        return listParam;
+      }
+    }
+  } catch {
+    // If URL constructor fails, fall back to regex
+  }
+
+  // 4. Robust regex for any URL or string containing list= parameter
+  const match = trimmed.match(/[?&]list=([a-zA-Z0-9_-]{10,64})/i);
+  if (match && match[1]) {
+    return match[1];
+  }
 
   return null;
 }
@@ -87,22 +93,16 @@ export function extractVideoId(urlOrId: string): string | null {
   const trimmed = urlOrId.trim();
 
   // If it's a direct 11-char YouTube video ID
-  if (/^[a-zA-Z0-9_-]{11}$/.test(trimmed)) {
+  if (/^[a-zA-Z0-9_-]{11}$/.test(trimmed) && !trimmed.includes('/') && !trimmed.includes('.')) {
     return trimmed;
   }
 
   // If it's a URL, enforce protocol and hostname allowlist
-  if (trimmed.includes('http://') || trimmed.includes('https://') || trimmed.includes('.com') || trimmed.includes('.be')) {
-    try {
-      const url = new URL(trimmed.startsWith('http') ? trimmed : `https://${trimmed}`);
-      
-      if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-        return null;
-      }
-      if (!isAllowedYouTubeHost(url.hostname)) {
-        return null;
-      }
-
+  try {
+    const urlStr = trimmed.startsWith('http://') || trimmed.startsWith('https://') ? trimmed : `https://${trimmed}`;
+    const url = new URL(urlStr);
+    
+    if (isAllowedYouTubeHost(url.hostname)) {
       if (url.hostname.includes('youtu.be')) {
         const id = url.pathname.slice(1).split('?')[0];
         if (/^[a-zA-Z0-9_-]{11}$/.test(id)) return id;
@@ -116,9 +116,9 @@ export function extractVideoId(urlOrId: string): string | null {
       if (embedIdx !== -1 && paths[embedIdx + 1] && /^[a-zA-Z0-9_-]{11}$/.test(paths[embedIdx + 1])) {
         return paths[embedIdx + 1];
       }
-    } catch {
-      return null;
     }
+  } catch {
+    // fallback to regex
   }
 
   const match = trimmed.match(/(?:youtu\.be\/|v\/|u\/\w\/|embed\/|watch\?v=)([a-zA-Z0-9_-]{11})/);
@@ -213,35 +213,235 @@ export const CURATED_EDUCATIONAL_PLAYLISTS: Record<string, {
 
 // Main Playlist Resolver with Single-Flight Deduplication and Database Caching
 export async function fetchPlaylistData(urlOrId: string): Promise<PlaylistFetchResult> {
-  const playlistId = extractPlaylistId(urlOrId) || urlOrId.trim();
-  const cacheKey = `playlist:${playlistId}`;
-
-  // 1. Check persistent SQLite cache first
-  const cached = getCachedYouTubeMetadata(cacheKey);
-  if (cached) {
-    return cached as PlaylistFetchResult;
+  if (!urlOrId || typeof urlOrId !== 'string') {
+    throw new Error('Playlist URL or ID is required.');
   }
 
-  // 2. Single-flight deduplication across concurrent requests
+  const trimmed = urlOrId.trim();
+  const playlistId = extractPlaylistId(trimmed);
+
+  if (!playlistId) {
+    const singleVid = extractVideoId(trimmed);
+    if (singleVid) {
+      throw new Error('The provided link is for a single YouTube video, not a playlist. Please paste a YouTube playlist link (containing ?list=...) or use the Add Single Video feature.');
+    }
+    throw new Error('Invalid YouTube playlist URL or ID. Please provide a valid playlist link (e.g. https://www.youtube.com/playlist?list=...) or playlist ID.');
+  }
+
+  // 1. Check exact match for curated educational course presets (only exact key match)
+  if (CURATED_EDUCATIONAL_PLAYLISTS[playlistId]) {
+    const preset = CURATED_EDUCATIONAL_PLAYLISTS[playlistId];
+    const videos: ParsedYouTubeItem[] = preset.videos.map((v, idx) => ({
+      youtubeVideoId: v.videoId,
+      title: v.title,
+      description: v.description,
+      durationSeconds: v.durationMinutes * 60,
+      thumbnailUrl: v.videoId ? `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg` : preset.thumbnailUrl,
+      channelName: preset.channelName,
+      originalPosition: idx + 1
+    }));
+    const totalDuration = videos.reduce((acc, v) => acc + v.durationSeconds, 0);
+    return {
+      playlistId,
+      title: preset.title,
+      channelName: preset.channelName,
+      videoCount: videos.length,
+      totalDurationSeconds: totalDuration,
+      thumbnailUrl: preset.thumbnailUrl,
+      videos,
+      source: 'fallback_preset'
+    };
+  }
+
+  const cacheKey = `playlist:${playlistId}`;
+
+  // 2. Check persistent SQLite cache first (verify it contains genuine videos)
+  const cached = getCachedYouTubeMetadata(cacheKey);
+  if (cached && (cached.source === 'api' || cached.source === 'scraped') && Array.isArray(cached.videos) && cached.videos.length > 0) {
+    const hasFake = cached.videos.some((v: any) => v.youtubeVideoId && v.youtubeVideoId.startsWith('yt_lec_'));
+    if (!hasFake) {
+      return cached as PlaylistFetchResult;
+    }
+  }
+
+  // 3. Single-flight deduplication across concurrent requests
   return inFlightDeduplicator.do(cacheKey, async () => {
     // Double-check cache inside lock
     const cachedAgain = getCachedYouTubeMetadata(cacheKey);
-    if (cachedAgain) return cachedAgain as PlaylistFetchResult;
+    if (cachedAgain && (cachedAgain.source === 'api' || cachedAgain.source === 'scraped') && Array.isArray(cachedAgain.videos) && cachedAgain.videos.length > 0) {
+      const hasFake = cachedAgain.videos.some((v: any) => v.youtubeVideoId && v.youtubeVideoId.startsWith('yt_lec_'));
+      if (!hasFake) return cachedAgain as PlaylistFetchResult;
+    }
 
     const result = await fetchPlaylistDataInternal(playlistId);
-    setCachedYouTubeMetadata(cacheKey, result, result.source, 7);
+    if (result && result.videos && result.videos.length > 0) {
+      setCachedYouTubeMetadata(cacheKey, result, result.source, 7);
+    }
     return result;
   });
 }
 
+// Scrape public YouTube playlist HTML when YouTube API key is missing or quota is exceeded
+export async function scrapePublicYouTubePlaylist(playlistId: string): Promise<PlaylistFetchResult | null> {
+  try {
+    const url = `https://www.youtube.com/playlist?list=${encodeURIComponent(playlistId)}`;
+    const res = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+      }
+    });
+
+    if (!res.ok) {
+      return null;
+    }
+
+    const html = await res.text();
+
+    // Extract Title
+    const titleMatch = html.match(/<meta property="og:title" content="([^"]+)"/i) ||
+                       html.match(/<title>(.*?) - YouTube<\/title>/i) ||
+                       html.match(/<title>(.*?)<\/title>/i);
+    let title = titleMatch ? titleMatch[1].replace(/&amp;/g, '&').replace(/&#39;/g, "'").replace(/&quot;/g, '"') : '';
+    title = title.replace(/ - YouTube$/, '').trim();
+
+    if (!title || title.toLowerCase() === 'undefined' || title.toLowerCase() === 'youtube') {
+      return null;
+    }
+
+    // Extract Channel Name
+    const channelMatch = html.match(/"ownerText":\{"runs":\[\{"text":"([^"]+)"/i) ||
+                         html.match(/<link itemprop="name" content="([^"]+)"/i) ||
+                         html.match(/"author":"([^"]+)"/i);
+    const channelName = channelMatch ? channelMatch[1].replace(/&amp;/g, '&').replace(/&#39;/g, "'") : 'YouTube Educator';
+
+    // Parse videos from ytInitialData
+    const parsedVideos: ParsedYouTubeItem[] = [];
+    const initialDataMatch = html.match(/var ytInitialData\s*=\s*({.+?});<\/script>/s) ||
+                             html.match(/window\["ytInitialData"\]\s*=\s*({.+?});/s);
+
+    if (initialDataMatch) {
+      try {
+        const data = JSON.parse(initialDataMatch[1]);
+        const tabs = data.contents?.twoColumnBrowseResultsRenderer?.tabs || [];
+        const sectionContents = tabs[0]?.tabRenderer?.content?.sectionListRenderer?.contents || [];
+        const itemSectionContents = sectionContents[0]?.itemSectionRenderer?.contents || [];
+
+        for (const item of itemSectionContents) {
+          // Format 1: Modern lockupViewModel (2025/2026 YouTube layout)
+          if (item.lockupViewModel && item.lockupViewModel.contentId) {
+            const lockup = item.lockupViewModel;
+            const vId = lockup.contentId;
+            if (!/^[a-zA-Z0-9_-]{11}$/.test(vId)) continue;
+
+            const vTitle = lockup.metadata?.lockupMetadataViewModel?.title?.content || `Video ${parsedVideos.length + 1}`;
+
+            // Parse duration from overlay labels
+            let durationSeconds = 1800;
+            const overlays = lockup.contentImage?.thumbnailViewModel?.overlays || [];
+            for (const overlay of overlays) {
+              const label = overlay.thumbnailOverlayTimeStatusRenderer?.text?.accessibility?.accessibilityData?.label ||
+                            overlay.thumbnailBadgeViewModel?.rendererContext?.accessibilityContext?.label ||
+                            JSON.stringify(overlay);
+              const durationMatch = label.match(/(\d+\s*(?:hour|hr|minute|min|second|sec|hours|minutes|seconds)[\s,0-9a-zA-Z]*)/i);
+              if (durationMatch) {
+                let s = 0;
+                const h = durationMatch[1].match(/(\d+)\s*(?:hour|hr|hours)/i);
+                const m = durationMatch[1].match(/(\d+)\s*(?:minute|min|minutes)/i);
+                const sec = durationMatch[1].match(/(\d+)\s*(?:second|sec|seconds)/i);
+                if (h) s += parseInt(h[1], 10) * 3600;
+                if (m) s += parseInt(m[1], 10) * 60;
+                if (sec) s += parseInt(sec[1], 10);
+                if (s > 0) durationSeconds = s;
+              }
+            }
+
+            parsedVideos.push({
+              youtubeVideoId: vId,
+              title: vTitle,
+              description: '',
+              durationSeconds,
+              thumbnailUrl: `https://i.ytimg.com/vi/${vId}/hqdefault.jpg`,
+              channelName,
+              originalPosition: parsedVideos.length + 1
+            });
+          }
+          // Format 2: playlistVideoListRenderer / playlistVideoRenderer (classic YouTube layout)
+          else if (item.playlistVideoListRenderer?.contents) {
+            for (const vidItem of item.playlistVideoListRenderer.contents) {
+              const pvr = vidItem.playlistVideoRenderer;
+              if (!pvr || !pvr.videoId) continue;
+              const vId = pvr.videoId;
+              const vTitle = pvr.title?.runs?.[0]?.text || pvr.title?.simpleText || `Video ${parsedVideos.length + 1}`;
+              const durSec = parseInt(pvr.lengthSeconds || '1800', 10);
+              parsedVideos.push({
+                youtubeVideoId: vId,
+                title: vTitle,
+                description: '',
+                durationSeconds: isNaN(durSec) ? 1800 : durSec,
+                thumbnailUrl: `https://i.ytimg.com/vi/${vId}/hqdefault.jpg`,
+                channelName,
+                originalPosition: parsedVideos.length + 1
+              });
+            }
+          }
+        }
+      } catch (jsonErr) {
+        console.warn('Error parsing ytInitialData in scraper:', jsonErr);
+      }
+    }
+
+    // Format 3: Fallback regex on HTML watch links if ytInitialData had no video items
+    if (parsedVideos.length === 0) {
+      const vidMatches = [...html.matchAll(/\/watch\?v=([a-zA-Z0-9_-]{11})/g)].map(m => m[1]);
+      const uniqueIds = [...new Set(vidMatches)];
+      for (let i = 0; i < uniqueIds.length; i++) {
+        const vId = uniqueIds[i];
+        parsedVideos.push({
+          youtubeVideoId: vId,
+          title: `Video ${i + 1}`,
+          description: '',
+          durationSeconds: 1800,
+          thumbnailUrl: `https://i.ytimg.com/vi/${vId}/hqdefault.jpg`,
+          channelName,
+          originalPosition: i + 1
+        });
+      }
+    }
+
+    if (parsedVideos.length === 0) {
+      return null;
+    }
+
+    const totalSecs = parsedVideos.reduce((acc, v) => acc + v.durationSeconds, 0);
+    const thumb = parsedVideos[0]?.thumbnailUrl || `https://i.ytimg.com/vi/${playlistId}/hqdefault.jpg`;
+
+    return {
+      playlistId,
+      title,
+      channelName,
+      videoCount: parsedVideos.length,
+      totalDurationSeconds: totalSecs,
+      thumbnailUrl: thumb,
+      videos: parsedVideos,
+      source: 'scraped'
+    };
+  } catch (err) {
+    console.warn('Public playlist scraper failed:', err);
+    return null;
+  }
+}
+
 async function fetchPlaylistDataInternal(playlistId: string): Promise<PlaylistFetchResult> {
   const apiKey = process.env.YOUTUBE_API_KEY;
+  let apiFailureReason = '';
 
   // 1. If YouTube API Key is available, attempt official YouTube Data API v3
-  if (apiKey && apiKey.trim().length > 10 && playlistId.startsWith('PL')) {
+  if (apiKey && apiKey.trim().length > 10) {
     try {
       const playlistMetaRes = await fetch(
-        `https://www.googleapis.com/youtube/v3/playlists?part=snippet,contentDetails&id=${playlistId}&key=${apiKey}`
+        `https://www.googleapis.com/youtube/v3/playlists?part=snippet,contentDetails&id=${encodeURIComponent(playlistId)}&key=${apiKey}`
       );
       if (playlistMetaRes.ok) {
         const metaData = await playlistMetaRes.json();
@@ -249,7 +449,11 @@ async function fetchPlaylistDataInternal(playlistId: string): Promise<PlaylistFe
           const playlistSnippet = metaData.items[0].snippet;
           const title = playlistSnippet.title;
           const channelName = playlistSnippet.channelTitle;
-          const thumbnailUrl = playlistSnippet.thumbnails?.maxres?.url || playlistSnippet.thumbnails?.high?.url || playlistSnippet.thumbnails?.medium?.url || playlistSnippet.thumbnails?.default?.url || 'https://i.ytimg.com/vi/' + playlistId + '/hqdefault.jpg';
+          const thumbnailUrl = playlistSnippet.thumbnails?.maxres?.url || 
+                               playlistSnippet.thumbnails?.high?.url || 
+                               playlistSnippet.thumbnails?.medium?.url || 
+                               playlistSnippet.thumbnails?.default?.url || 
+                               `https://i.ytimg.com/vi/${playlistId}/hqdefault.jpg`;
 
           // Fetch items in playlist with pagination (up to 4 pages / 200 videos)
           const allRawItems: any[] = [];
@@ -257,7 +461,7 @@ async function fetchPlaylistDataInternal(playlistId: string): Promise<PlaylistFe
           let pagesCount = 0;
 
           while (pagesCount < 4) {
-            const pageUrl: string = `https://www.googleapis.com/youtube/v3/playlistItems?part=snippet,contentDetails&maxResults=50&playlistId=${playlistId}&key=${apiKey}${pageToken ? `&pageToken=${pageToken}` : ''}`;
+            const pageUrl: string = `https://www.googleapis.com/youtube/v3/playlistItems?part=snippet,contentDetails&maxResults=50&playlistId=${encodeURIComponent(playlistId)}&key=${apiKey}${pageToken ? `&pageToken=${pageToken}` : ''}`;
             const itemsRes = await fetch(pageUrl);
             if (!itemsRes.ok) break;
 
@@ -295,7 +499,7 @@ async function fetchPlaylistDataInternal(playlistId: string): Promise<PlaylistFe
               .filter((item: any) => item.snippet?.title !== 'Private video' && item.snippet?.title !== 'Deleted video')
               .map((item: any, index: number) => {
                 const vId = item.contentDetails?.videoId || `yt_${index}`;
-                const duration = durationsMap[vId] || (30 + (index * 7) % 35) * 60;
+                const duration = durationsMap[vId] || 1800;
                 return {
                   youtubeVideoId: vId,
                   title: item.snippet.title,
@@ -320,102 +524,46 @@ async function fetchPlaylistDataInternal(playlistId: string): Promise<PlaylistFe
               source: 'api'
             };
           }
+        } else {
+          apiFailureReason = 'Playlist not found or empty on YouTube';
         }
+      } else {
+        const errJson = await playlistMetaRes.json().catch(() => null);
+        apiFailureReason = errJson?.error?.message || `HTTP ${playlistMetaRes.status}`;
+        console.warn('YouTube API call returned non-200:', playlistMetaRes.status, apiFailureReason);
       }
-    } catch (apiErr) {
-      console.warn('YouTube API call failed or quota exceeded, proceeding with fallback parser:', apiErr);
+    } catch (apiErr: any) {
+      apiFailureReason = apiErr.message || 'Network error';
+      console.warn('YouTube API call failed:', apiErr);
     }
   }
 
-  // 2. Check if it matches any curated educational course presets (or key substring)
-  const lower = playlistId.toLowerCase();
-  for (const [key, preset] of Object.entries(CURATED_EDUCATIONAL_PLAYLISTS)) {
-    if (lower.includes(key.toLowerCase()) || 
-        (lower.includes('network') && key.includes('network')) ||
-        (lower.includes('control') && key.includes('control')) ||
-        (lower.includes('signal') && key.includes('signals')) ||
-        (lower.includes('dsa') && key.includes('dsa')) ||
-        (lower.includes('algo') && key.includes('dsa'))) {
-      const videos: ParsedYouTubeItem[] = preset.videos.map((v, idx) => ({
-        youtubeVideoId: v.videoId,
-        title: v.title,
-        description: v.description,
-        durationSeconds: v.durationMinutes * 60,
-        thumbnailUrl: v.videoId ? `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg` : preset.thumbnailUrl,
-        channelName: preset.channelName,
-        originalPosition: idx + 1
-      }));
-      const totalDuration = videos.reduce((acc, v) => acc + v.durationSeconds, 0);
-      return {
-        playlistId,
-        title: preset.title,
-        channelName: preset.channelName,
-        videoCount: videos.length,
-        totalDurationSeconds: totalDuration,
-        thumbnailUrl: preset.thumbnailUrl,
-        videos,
-        source: 'fallback_preset'
-      };
-    }
+  // 2. Fallback to public scraper (handles instances where API key is missing or quota exceeded)
+  const scraped = await scrapePublicYouTubePlaylist(playlistId);
+  if (scraped && scraped.videos && scraped.videos.length > 0) {
+    return scraped;
   }
 
-  // 3. Fallback: Parse public metadata / generate structured series for whatever topic or URL user pasted
-  // Extract a clean course name from URL or ID
-  let inferredSubject = 'Electrical & Computer Engineering Subject';
-  if (lower.includes('gate')) inferredSubject = 'GATE Preparation Course';
-  else if (lower.includes('math')) inferredSubject = 'Advanced Engineering Mathematics';
-  else if (lower.includes('physics')) inferredSubject = 'Fundamental Physics Lectures';
-  else if (lower.includes('upsc')) inferredSubject = 'UPSC Comprehensive Foundation';
-  else if (lower.includes('jee')) inferredSubject = 'JEE Advanced Complete Series';
-  else if (lower.includes('python') || lower.includes('code')) inferredSubject = 'Software Engineering & Programming';
+  // 3. Informative error reporting — NEVER return fake demo data
+  if (!apiKey || apiKey.trim().length <= 10) {
+    throw new Error(`Could not fetch YouTube playlist "${playlistId}". Please ensure the playlist exists and is public. (Note: On Render, configure the YOUTUBE_API_KEY environment variable for reliable YouTube Data API access).`);
+  }
 
-  // Generate a realistic 12-lecture complete structured playlist for the pasted URL
-  const lectureTitles = [
-    `01. Introduction and Core Fundamentals of ${inferredSubject}`,
-    `02. Theoretical Foundations and Fundamental Laws`,
-    `03. Mathematical Formulation & Modeling Techniques`,
-    `04. Standard Problem Solving Methodologies (Part 1)`,
-    `05. Standard Problem Solving Methodologies (Part 2)`,
-    `06. Advanced Concepts & Real-World System Behavior`,
-    `07. Deep Dive: Frequency Domain & Response Characteristics`,
-    `08. Comprehensive Previous Year Questions (PYQs) Analysis`,
-    `09. Common Trap Questions and Shortcut Techniques`,
-    `10. High-Yield Theorem Applications & Summary`,
-    `11. Numerical Masterclass: Multi-Concept Problems`,
-    `12. Complete Subject Revision & Formula Cheat Sheet`
-  ];
+  if (apiFailureReason) {
+    throw new Error(`YouTube playlist "${playlistId}" could not be retrieved (${apiFailureReason}). Please check that the playlist is public.`);
+  }
 
-  const durations = [45, 52, 58, 44, 62, 55, 68, 50, 48, 64, 70, 56]; // in minutes
-
-  const fallbackVideos: ParsedYouTubeItem[] = lectureTitles.map((title, idx) => ({
-    youtubeVideoId: `yt_lec_${idx + 1}_${Math.random().toString(36).substring(2, 7)}`,
-    title,
-    description: `Comprehensive video lecture covering syllabus topics for ${inferredSubject}.`,
-    durationSeconds: durations[idx] * 60,
-    thumbnailUrl: `https://i.ytimg.com/vi/b4_Jz7o_gW0/hqdefault.jpg`,
-    channelName: 'National Educational Channel',
-    originalPosition: idx + 1
-  }));
-
-  const totalSecs = fallbackVideos.reduce((acc, v) => acc + v.durationSeconds, 0);
-
-  return {
-    playlistId,
-    title: `${inferredSubject} Playlist`,
-    channelName: 'Academic Video Archive',
-    videoCount: fallbackVideos.length,
-    totalDurationSeconds: totalSecs,
-    thumbnailUrl: 'https://images.unsplash.com/photo-1516321318423-f06f85e504b3?w=640&q=80',
-    videos: fallbackVideos,
-    source: 'parsed'
-  };
+  throw new Error(`YouTube playlist "${playlistId}" was not found or is private. Please ensure the link is correct and the playlist is set to Public or Unlisted on YouTube.`);
 }
 
 // Fetch single video details with caching and deduplication
 export async function fetchSingleVideo(urlOrId: string): Promise<ParsedYouTubeItem> {
   const videoId = extractVideoId(urlOrId) || urlOrId.trim();
-  const cacheKey = `video:${videoId}`;
+  if (!videoId || !/^[a-zA-Z0-9_-]{11}$/.test(videoId)) {
+    throw new Error('Invalid YouTube video link or ID. Please provide a valid 11-character video ID or watch link.');
+  }
 
+  const cacheKey = `video:${videoId}`;
   const cached = getCachedYouTubeMetadata(cacheKey);
   if (cached) return cached as ParsedYouTubeItem;
 
@@ -455,14 +603,25 @@ async function fetchSingleVideoInternal(videoId: string): Promise<ParsedYouTubeI
     }
   }
 
-  // Fallback single video
-  return {
-    youtubeVideoId: videoId,
-    title: `YouTube Video Lecture (${videoId})`,
-    description: 'Educational lecture video.',
-    durationSeconds: 45 * 60,
-    thumbnailUrl: 'https://images.unsplash.com/photo-1516321318423-f06f85e504b3?w=640&q=80',
-    channelName: 'Academic Content',
-    originalPosition: 1
-  };
+  // Fallback via oEmbed to get real title and creator
+  try {
+    const oembedRes = await fetch(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`);
+    if (oembedRes.ok) {
+      const oembedData = await oembedRes.json();
+      return {
+        youtubeVideoId: videoId,
+        title: oembedData.title || `YouTube Video (${videoId})`,
+        description: '',
+        durationSeconds: 1800,
+        thumbnailUrl: oembedData.thumbnail_url || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+        channelName: oembedData.author_name || 'YouTube Creator',
+        originalPosition: 1
+      };
+    }
+  } catch (oeErr) {
+    console.warn('Single video oEmbed failed:', oeErr);
+  }
+
+  throw new Error(`YouTube video "${videoId}" could not be found or is private.`);
 }
+
