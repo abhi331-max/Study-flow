@@ -97,6 +97,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({ onStartDemo, onAuthSuc
     }
   };
 
+  const googleButtonRef = React.useRef<HTMLDivElement | null>(null);
   const [googleLoading, setGoogleLoading] = useState(false);
   const [googleClientId, setGoogleClientId] = useState<string>("");
 
@@ -112,54 +113,79 @@ export const LandingPage: React.FC<LandingPageProps> = ({ onStartDemo, onAuthSuc
       .catch(() => {});
   }, []);
 
-  // Initialize Google Identity Services (GIS) when available
+  // Standard Google Identity Services credential response callback
+  const handleCredentialResponse = async (response: { credential?: string }) => {
+    if (!response || !response.credential) {
+      setError("No credential returned by Google");
+      setGoogleLoading(false);
+      return;
+    }
+
+    setGoogleLoading(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/auth/google", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ credential: response.credential })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || "Google authentication failed");
+      }
+      localStorage.setItem("studyflow_token", data.token);
+      onAuthSuccess(data.token, data.user);
+    } catch (err: any) {
+      setError(err.message || "Google authentication failed");
+    } finally {
+      setGoogleLoading(false);
+    }
+  };
+
+  // Initialize Google Identity Services (GIS) and render the official Google button
   useEffect(() => {
     if (typeof window === "undefined" || !googleClientId) return;
-    const initGsi = () => {
+
+    const initAndRenderGsi = () => {
       const google = (window as any).google;
       if (google?.accounts?.id) {
         google.accounts.id.initialize({
           client_id: googleClientId,
-          callback: async (response: any) => {
-            if (response.credential) {
-              setGoogleLoading(true);
-              try {
-                const res = await fetch("/api/auth/google", {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ credential: response.credential })
-                });
-                const data = await res.json();
-                if (!res.ok) throw new Error(data.error || "Google authentication failed");
-                localStorage.setItem("studyflow_token", data.token);
-                onAuthSuccess(data.token, data.user);
-              } catch (err: any) {
-                setError(err.message || "Google authentication failed");
-              } finally {
-                setGoogleLoading(false);
-              }
-            }
-          },
+          callback: handleCredentialResponse,
           auto_select: false,
           cancel_on_tap_outside: true
         });
+
+        // Render official Sign In with Google button if container is mounted in DOM
+        if (googleButtonRef.current) {
+          googleButtonRef.current.innerHTML = "";
+          google.accounts.id.renderButton(googleButtonRef.current, {
+            type: "standard",
+            shape: "rectangular",
+            theme: "outline",
+            text: isSignUp ? "signup_with" : "continue_with",
+            size: "large",
+            logo_alignment: "left",
+            width: 360
+          });
+        }
       }
     };
 
     if ((window as any).google?.accounts?.id) {
-      initGsi();
+      initAndRenderGsi();
     } else {
       const interval = setInterval(() => {
         if ((window as any).google?.accounts?.id) {
           clearInterval(interval);
-          initGsi();
+          initAndRenderGsi();
         }
-      }, 300);
+      }, 200);
       return () => clearInterval(interval);
     }
-  }, [googleClientId]);
+  }, [googleClientId, authModalOpen, isSignUp]);
 
-  const handleGoogleLogin = async () => {
+  const handleGoogleLogin = () => {
     setError(null);
 
     // If GOOGLE_CLIENT_ID is not configured, inform the user cleanly
@@ -168,27 +194,25 @@ export const LandingPage: React.FC<LandingPageProps> = ({ onStartDemo, onAuthSuc
       return;
     }
 
-    setGoogleLoading(true);
-    try {
-      const google = typeof window !== "undefined" ? (window as any).google : null;
-
-      // Trigger Google Identity Services One-Tap / Account Chooser prompt
-      if (google?.accounts?.id) {
-        google.accounts.id.prompt((notification: any) => {
-          if (notification.isNotDisplayed() || notification.isSkippedMoment()) {
-            setGoogleLoading(false);
-            setError("Google Sign-In prompt was closed or unavailable. Please try again.");
-          }
-        });
-        return;
-      }
-
+    const google = typeof window !== "undefined" ? (window as any).google : null;
+    if (!google?.accounts?.id) {
       setError("Google Sign-In service is still loading. Please try again in a moment.");
-    } catch (err: any) {
-      setError(err.message || "Google authentication failed");
-    } finally {
-      setGoogleLoading(false);
+      return;
     }
+
+    // Click the rendered Google button programmatically if available
+    const renderedBtn = googleButtonRef.current?.querySelector('div[role="button"]') as HTMLElement | null;
+    if (renderedBtn) {
+      renderedBtn.click();
+      return;
+    }
+
+    // Trigger Google Identity Services One-Tap / Account Chooser prompt
+    google.accounts.id.prompt((notification: any) => {
+      if (notification.isNotDisplayed() || notification.isSkippedMoment()) {
+        setError("Please click the Google button directly or sign in with email and password.");
+      }
+    });
   };
 
   const handleAuthSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
@@ -576,38 +600,51 @@ export const LandingPage: React.FC<LandingPageProps> = ({ onStartDemo, onAuthSuc
             )}
 
             
-            {/* Google Authentication Button */}
-            <button
-              type="button"
-              id="google-login-btn"
-              disabled={googleLoading || loading}
-              onClick={() => handleGoogleLogin()}
-              className="w-full py-2.5 px-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-800/90 hover:bg-slate-50 dark:hover:bg-slate-800 text-xs font-semibold text-slate-800 dark:text-slate-200 shadow-xs flex items-center justify-center gap-2.5 transition-all hover:border-slate-300 dark:hover:border-slate-700"
-            >
-              {googleLoading ? (
-                <div className="w-4 h-4 border-2 border-slate-400 border-t-transparent rounded-full animate-spin" />
+            {/* Google Authentication Section */}
+            <div className="w-full mb-4">
+              {googleClientId ? (
+                <div className="w-full flex flex-col items-center justify-center min-h-[44px]">
+                  {googleLoading && (
+                    <div className="w-full py-2.5 px-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-800 text-xs font-semibold text-slate-800 dark:text-slate-200 shadow-xs flex items-center justify-center gap-2.5 mb-2">
+                      <div className="w-4 h-4 border-2 border-slate-400 border-t-transparent rounded-full animate-spin" />
+                      <span>Authenticating with Google...</span>
+                    </div>
+                  )}
+                  <div
+                    ref={googleButtonRef}
+                    id="google-signin-btn-container"
+                    className={`w-full flex justify-center [&>div]:!w-full [&>div>iframe]:!w-full min-h-[44px] ${googleLoading ? 'opacity-50 pointer-events-none' : ''}`}
+                  />
+                </div>
               ) : (
-                <svg className="w-4 h-4 shrink-0" viewBox="0 0 24 24">
-                  <path
-                    fill="#4285F4"
-                    d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.82-2.4 3.68v3.05h3.88c2.27-2.09 3.665-5.17 3.665-9.17z"
-                  />
-                  <path
-                    fill="#34A853"
-                    d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.05c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.1-6.72-4.93H1.25v3.15C3.26 21.36 7.34 24 12 24z"
-                  />
-                  <path
-                    fill="#FBBC05"
-                    d="M5.28 14.27c-.25-.72-.38-1.49-.38-2.27s.13-1.55.38-2.27V6.58H1.25C.45 8.18 0 9.99 0 12s.45 3.82 1.25 5.42l4.03-3.15z"
-                  />
-                  <path
-                    fill="#EA4335"
-                    d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.34 0 3.26 2.64 1.25 6.58l4.03 3.15c.95-2.83 3.6-4.98 6.72-4.98z"
-                  />
-                </svg>
+                <button
+                  type="button"
+                  id="google-login-btn"
+                  disabled
+                  className="w-full py-2.5 px-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/50 text-xs font-medium text-slate-400 flex items-center justify-center gap-2 cursor-not-allowed"
+                >
+                  <svg className="w-4 h-4 shrink-0 opacity-40" viewBox="0 0 24 24">
+                    <path
+                      fill="#4285F4"
+                      d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.82-2.4 3.68v3.05h3.88c2.27-2.09 3.665-5.17 3.665-9.17z"
+                    />
+                    <path
+                      fill="#34A853"
+                      d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.05c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.1-6.72-4.93H1.25v3.15C3.26 21.36 7.34 24 12 24z"
+                    />
+                    <path
+                      fill="#FBBC05"
+                      d="M5.28 14.27c-.25-.72-.38-1.49-.38-2.27s.13-1.55.38-2.27V6.58H1.25C.45 8.18 0 9.99 0 12s.45 3.82 1.25 5.42l4.03-3.15z"
+                    />
+                    <path
+                      fill="#EA4335"
+                      d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.34 0 3.26 2.64 1.25 6.58l4.03 3.15c.95-2.83 3.6-4.98 6.72-4.98z"
+                    />
+                  </svg>
+                  <span>Google Sign-In is not configured yet. Please use email and password.</span>
+                </button>
               )}
-              <span>{isSignUp ? "Sign up with Google" : "Continue with Google"}</span>
-            </button>
+            </div>
 
             {/* Subtle Divider */}
             <div className="relative my-4 flex items-center justify-center">
